@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Table Stakes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,400..800&family=IBM+Plex+Mono:wght@400;500;600&family=Inter+Tight:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --stone:#EDE4E2;
+  --paper:#FDFAF8;
+  --ink:#241A20;
+  --ink-soft:#6B5A60;
+  --quartz:#A8455E;
+  --prairie:#456B52;
+  --amber:#D8A03C;
+  --line:rgba(36,26,32,.14);
+  --shadow:0 1px 0 rgba(36,26,32,.09), 0 12px 28px -18px rgba(36,26,32,.5);
+  --display:"Bricolage Grotesque",system-ui,sans-serif;
+  --body:"Inter Tight",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,monospace;
+}
+
+*{box-sizing:border-box}
+html,body{margin:0}
+body{
+  background:var(--stone);
+  color:var(--ink);
+  font-family:var(--body);
+  font-size:16px;
+  line-height:1.45;
+  -webkit-font-smoothing:antialiased;
+  min-height:100vh;
+}
+
+/* ---------------------------------------------------------- top bar */
+
+.topbar{
+  display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+  padding:14px 20px;border-bottom:1px solid var(--line);
+  background:color-mix(in srgb,var(--stone) 80%,white);
+  position:sticky;top:0;z-index:10;
+  backdrop-filter:blur(6px);
+}
+.wordmark{
+  font-family:var(--display);
+  font-weight:800;font-size:19px;letter-spacing:-.02em;
+  font-variation-settings:"wdth" 82;
+  margin-right:auto;display:flex;align-items:baseline;gap:8px;
+}
+.wordmark span{
+  font-family:var(--mono);font-size:10px;font-weight:500;
+  letter-spacing:.14em;text-transform:uppercase;color:var(--quartz);
+}
+
+.seg{display:flex;border:1px solid var(--line);border-radius:999px;overflow:hidden;background:var(--paper)}
+.seg button{
+  appearance:none;border:0;background:transparent;cursor:pointer;
+  font-family:var(--mono);font-size:11px;font-weight:500;
+  letter-spacing:.09em;text-transform:uppercase;
+  padding:7px 13px;color:var(--ink-soft);
+}
+.seg button[aria-pressed="true"]{background:var(--ink);color:var(--paper)}
+.seg button:focus-visible{outline:2px solid var(--quartz);outline-offset:-2px}
+
+/* ---------------------------------------------------------- shell */
+
+main{max-width:960px;margin:0 auto;padding:26px 20px 72px}
+.view[hidden]{display:none}
+
+.eyebrow{
+  font-family:var(--mono);font-size:11px;font-weight:500;
+  letter-spacing:.13em;text-transform:uppercase;color:var(--ink-soft);
+  margin:0 0 18px;
+}
+.eyebrow b{color:var(--quartz);font-weight:600}
+
+/* ---------------------------------------------------------- duel */
+
+.duel{display:grid;grid-template-columns:1fr auto 1fr;gap:14px;align-items:stretch}
+
+.card{
+  position:relative;display:flex;flex-direction:column;text-align:left;
+  background:var(--paper);border:1px solid var(--line);border-radius:4px;
+  box-shadow:var(--shadow);
+  padding:26px 22px 20px;cursor:pointer;
+  font:inherit;color:inherit;appearance:none;
+  transition:transform .16s ease, box-shadow .16s ease, border-color .16s ease;
+}
+.card:hover{transform:translateY(-3px);border-color:rgba(168,69,94,.45)}
+.card:focus-visible{outline:2px solid var(--quartz);outline-offset:3px}
+.card.win{border-color:var(--prairie);transform:translateY(-6px)}
+.card.lose{opacity:.42;transform:scale(.98)}
+
+.card .rank{
+  font-family:var(--mono);font-size:10px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--ink-soft);margin-bottom:12px;
+}
+.card h2{
+  font-family:var(--display);font-weight:700;font-variation-settings:"wdth" 88;
+  font-size:clamp(24px,4.4vw,34px);line-height:1.05;letter-spacing:-.02em;
+  margin:0 0 10px;
+}
+.card .meta{font-size:13.5px;color:var(--ink-soft);margin:0}
+.card .foot{
+  display:flex;align-items:baseline;gap:10px;margin-top:auto;padding-top:22px;
+  font-family:var(--mono);font-size:12px;color:var(--ink-soft);
+}
+.card .foot .elo{font-size:15px;font-weight:600;color:var(--ink)}
+
+.delta{
+  position:absolute;top:14px;right:16px;
+  font-family:var(--mono);font-size:13px;font-weight:600;
+  padding:3px 8px;border-radius:3px;opacity:0;transform:translateY(4px);
+  transition:opacity .2s ease,transform .2s ease;
+}
+.delta.show{opacity:1;transform:translateY(0)}
+.delta.up{background:rgba(69,107,82,.14);color:var(--prairie)}
+.delta.down{background:rgba(168,69,94,.12);color:var(--quartz)}
+
+.versus{
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--display);font-weight:800;font-size:13px;
+  letter-spacing:.1em;color:var(--quartz);
+  writing-mode:vertical-rl;padding:0 2px;
+}
+
+/* signature: the odds bar */
+.odds{margin-top:20px}
+.odds-track{
+  display:flex;height:8px;border-radius:999px;overflow:hidden;
+  background:var(--line);border:1px solid var(--line);
+}
+.odds-track i{display:block;transition:width .5s cubic-bezier(.4,0,.2,1)}
+.odds-track i.left{background:var(--quartz)}
+.odds-track i.right{background:var(--ink)}
+.odds-legend{
+  display:flex;justify-content:space-between;gap:12px;margin-top:8px;
+  font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--ink-soft);
+}
+.odds-note{margin:10px 0 0;font-size:13px;color:var(--ink-soft)}
+
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+.btn{
+  appearance:none;font:inherit;cursor:pointer;
+  background:transparent;border:1px solid var(--line);border-radius:999px;
+  padding:8px 15px;font-size:13.5px;color:var(--ink);
+  transition:background .15s ease,border-color .15s ease;
+}
+.btn:hover{background:var(--paper);border-color:rgba(36,26,32,.32)}
+.btn:focus-visible{outline:2px solid var(--quartz);outline-offset:2px}
+.btn.strong{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.btn.quiet{color:var(--ink-soft)}
+
+.keys{
+  margin-top:18px;font-family:var(--mono);font-size:11px;
+  letter-spacing:.06em;color:var(--ink-soft);
+}
+.keys kbd{
+  font-family:var(--mono);background:var(--paper);
+  border:1px solid var(--line);border-bottom-width:2px;border-radius:3px;
+  padding:1px 5px;font-size:10px;
+}
+
+/* ---------------------------------------------------------- board */
+
+.board{list-style:none;margin:0;padding:0}
+.board li{
+  display:grid;grid-template-columns:38px 1fr auto;gap:14px;align-items:baseline;
+  padding:12px 4px;border-bottom:1px solid var(--line);
+}
+.board li:first-child .name{font-size:20px}
+.board .pos{font-family:var(--mono);font-size:13px;color:var(--ink-soft)}
+.board li:nth-child(-n+3) .pos{color:var(--quartz);font-weight:600}
+.board .name{
+  font-family:var(--display);font-weight:600;font-variation-settings:"wdth" 90;
+  font-size:17px;letter-spacing:-.01em;
+}
+.board .sub{font-size:12.5px;color:var(--ink-soft);font-family:var(--body)}
+.board .score{font-family:var(--mono);font-size:15px;font-weight:600;text-align:right}
+.board .score small{display:block;font-weight:400;font-size:11px;color:var(--ink-soft)}
+.disagree{color:var(--amber);font-weight:600}
+
+.splits{list-style:none;margin:0;padding:0}
+.splits li{
+  padding:12px 4px;border-bottom:1px solid var(--line);
+  display:flex;flex-wrap:wrap;gap:4px 16px;align-items:baseline;
+}
+.splits .matchup{
+  font-family:var(--display);font-weight:600;font-variation-settings:"wdth" 90;
+  font-size:16px;flex:1 1 260px;
+}
+.splits .matchup em{
+  font-style:normal;font-family:var(--mono);font-size:11px;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--quartz);margin:0 4px;
+}
+.splits .verdicts{font-size:13px;color:var(--ink-soft)}
+.splits .verdicts strong{color:var(--ink);font-weight:600}
+
+/* ---------------------------------------------------------- prune */
+
+.search{
+  width:100%;padding:10px 14px;font:inherit;
+  border:1px solid var(--line);border-radius:4px;background:var(--paper);
+  margin-bottom:16px;
+}
+.search:focus-visible{outline:2px solid var(--quartz);outline-offset:-1px}
+.prune{list-style:none;margin:0;padding:0}
+.prune li{
+  display:flex;align-items:center;gap:12px;
+  padding:9px 4px;border-bottom:1px solid var(--line);
+}
+.prune .name{flex:1;font-size:15px}
+.prune li.off .name{color:var(--ink-soft);text-decoration:line-through}
+.prune .tiny{
+  font-family:var(--mono);font-size:11px;letter-spacing:.06em;
+  text-transform:uppercase;padding:5px 10px;border-radius:999px;
+  border:1px solid var(--line);background:transparent;cursor:pointer;color:var(--ink-soft);
+}
+.prune .tiny:hover{background:var(--paper)}
+
+/* ---------------------------------------------------------- states */
+
+.note{
+  background:var(--paper);border:1px solid var(--line);border-left:3px solid var(--quartz);
+  border-radius:3px;padding:16px 18px;font-size:14.5px;
+}
+.note code{font-family:var(--mono);font-size:12.5px;background:var(--stone);padding:1px 5px;border-radius:2px}
+.loading{font-family:var(--mono);font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-soft)}
+
+@media (max-width:680px){
+  .duel{grid-template-columns:1fr;gap:10px}
+  .versus{writing-mode:horizontal-tb;padding:2px 0}
+  .card{padding:20px 18px 16px}
+  .card .foot{padding-top:14px}
+}
+@media (prefers-reduced-motion:reduce){
+  *{transition:none!important;animation:none!important}
+}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="wordmark">Table Stakes <span>Sioux Falls</span></div>
+  <div class="seg" id="userSeg" role="group" aria-label="Who's voting"></div>
+  <div class="seg" role="group" aria-label="View">
+    <button data-view="duel" aria-pressed="true">Rate</button>
+    <button data-view="board" aria-pressed="false">Rankings</button>
+    <button data-view="prune" aria-pressed="false">List</button>
+  </div>
+</div>
+
+<main>
+  <!-- Rate ------------------------------------------------------------ -->
+  <section class="view" id="view-duel">
+    <p class="eyebrow" id="duelStats">Loading…</p>
+    <div id="duelBody"></div>
+  </section>
+
+  <!-- Rankings -------------------------------------------------------- -->
+  <section class="view" id="view-board" hidden>
+    <p class="eyebrow" id="boardStats">Rankings</p>
+    <div id="boardBody"><p class="loading">Loading…</p></div>
+    <div id="splitBody"></div>
+  </section>
+
+  <!-- List ------------------------------------------------------------ -->
+  <section class="view" id="view-prune" hidden>
+    <p class="eyebrow">Turn off anywhere you haven't eaten. It stops showing up in your matchups.</p>
+    <input class="search" id="pruneSearch" type="search" placeholder="Search restaurants" autocomplete="off">
+    <div id="pruneBody"><p class="loading">Loading…</p></div>
+  </section>
+</main>
+
+<script>
+// ============================================================ CONFIGURE ME
+const API    = 'PASTE_YOUR_APPS_SCRIPT_EXEC_URL_HERE';
+const SECRET = 'CHANGE_ME_TO_SOMETHING_RANDOM';
+// ==========================================================================
+
+const store = (() => {
+  try { localStorage.setItem('__t','1'); localStorage.removeItem('__t');
+        return localStorage; } catch (e) { const m={}; return {
+        getItem:k=>k in m?m[k]:null, setItem:(k,v)=>{m[k]=String(v)} }; }
+})();
+
+let users = [];
+let user  = store.getItem('ts_user') || '';
+let view  = 'duel';
+let pair  = null;
+let busy  = false;
+let listCache = [];
+
+const $ = s => document.querySelector(s);
+
+async function api(action, params = {}, write = false) {
+  const payload = Object.assign({ action, secret: SECRET, user }, params);
+  let res;
+  if (write) {
+    // No Content-Type header on purpose: keeps this a "simple request" so the
+    // browser skips the CORS preflight that Apps Script can't answer.
+    res = await fetch(API, { method: 'POST', body: JSON.stringify(payload) });
+  } else {
+    const qs = new URLSearchParams(payload).toString();
+    res = await fetch(API + '?' + qs);
+  }
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || 'Request failed');
+  return data;
+}
+
+// ---------------------------------------------------------------- chrome
+
+function setView(next) {
+  view = next;
+  document.querySelectorAll('[data-view]').forEach(b =>
+    b.setAttribute('aria-pressed', String(b.dataset.view === next)));
+  ['duel','board','prune'].forEach(v =>
+    $('#view-' + v).hidden = v !== next);
+  if (next === 'board') loadBoard();
+  if (next === 'prune') loadPrune();
+}
+
+document.querySelectorAll('[data-view]').forEach(b =>
+  b.addEventListener('click', () => setView(b.dataset.view)));
+
+function renderUserSeg() {
+  $('#userSeg').innerHTML = users.map(u =>
+    `<button data-user="${u}" aria-pressed="${u === user}">${u}</button>`).join('');
+  $('#userSeg').querySelectorAll('button').forEach(b =>
+    b.addEventListener('click', () => {
+      user = b.dataset.user;
+      store.setItem('ts_user', user);
+      renderUserSeg();
+      loadPair();
+      if (view === 'prune') loadPrune();
+    }));
+}
+
+// ---------------------------------------------------------------- duel
+
+function cardHTML(side, c) {
+  return `
+  <button class="card" data-side="${side}">
+    <div class="rank">${side === 'a' ? 'Left' : 'Right'}${c.matches ? ' · ' + c.matches + ' matchup' + (c.matches === 1 ? '' : 's') : ' · never rated'}</div>
+    <h2>${escapeHTML(c.name)}</h2>
+    <p class="meta">${escapeHTML([c.cuisine, c.address].filter(Boolean).join(' · ')) || '&nbsp;'}</p>
+    <div class="foot"><span class="elo">${c.elo}</span><span>rating</span></div>
+    <div class="delta" data-delta="${side}"></div>
+  </button>`;
+}
+
+function renderPair(p) {
+  const pctA = Math.round(p.expectedA * 100);
+  const fav  = pctA >= 50 ? p.a : p.b;
+  const favP = Math.max(pctA, 100 - pctA);
+
+  $('#duelBody').innerHTML = `
+    <div class="duel">
+      ${cardHTML('a', p.a)}
+      <div class="versus">vs</div>
+      ${cardHTML('b', p.b)}
+    </div>
+    <div class="odds">
+      <div class="odds-track">
+        <i class="left" style="width:${pctA}%"></i>
+        <i class="right" style="width:${100 - pctA}%"></i>
+      </div>
+      <div class="odds-legend"><span>${pctA}%</span><span>${100 - pctA}%</span></div>
+      <p class="odds-note">${favP === 50
+        ? 'Dead even on the list so far. Your call breaks it.'
+        : `The list so far favors <strong>${escapeHTML(fav.name)}</strong> here.`}</p>
+    </div>
+    <div class="actions">
+      <button class="btn strong" data-act="tie">Too close to call</button>
+      <button class="btn" data-act="skip-a">Never been to ${escapeHTML(short(p.a.name))}</button>
+      <button class="btn" data-act="skip-b">Never been to ${escapeHTML(short(p.b.name))}</button>
+      <button class="btn quiet" data-act="skip">Different pair</button>
+    </div>
+    <p class="keys"><kbd>←</kbd> left wins &nbsp; <kbd>→</kbd> right wins &nbsp; <kbd>T</kbd> tie &nbsp; <kbd>S</kbd> new pair</p>`;
+
+  $('#duelBody').querySelectorAll('.card').forEach(el =>
+    el.addEventListener('click', () => submit(el.dataset.side)));
+  $('#duelBody').querySelectorAll('[data-act]').forEach(el =>
+    el.addEventListener('click', () => act(el.dataset.act)));
+}
+
+async function loadPair() {
+  if (!user) return;
+  $('#duelStats').textContent = 'Finding a matchup…';
+  try {
+    const d = await api('pair');
+    pair = d.pair;
+    renderPair(pair);
+    const s = d.stats;
+    const contrib = Object.keys(s.byUser).map(u => `${u} ${s.byUser[u]}`).join(' · ');
+    $('#duelStats').innerHTML =
+      `<b>${s.votes}</b> matchups judged into one list (${escapeHTML(contrib)}) · ${s.untested} places still untested`;
+  } catch (e) {
+    showError(e);
+  } finally { busy = false; }
+}
+
+async function submit(result) {
+  if (busy || !pair) return;
+  busy = true;
+  const cards = { a: $('[data-side="a"]'), b: $('[data-side="b"]') };
+  try {
+    const d = await api('vote', { a: pair.a.id, b: pair.b.id, result }, true);
+    ['a','b'].forEach(side => {
+      const won = result === side;
+      cards[side].classList.add(result === 'tie' ? 'win' : (won ? 'win' : 'lose'));
+      const delta = d[side].delta;
+      const chip = cards[side].querySelector('[data-delta]');
+      chip.textContent = (delta >= 0 ? '+' : '') + delta;
+      chip.className = 'delta show ' + (delta >= 0 ? 'up' : 'down');
+    });
+    setTimeout(loadPair, 620);
+  } catch (e) { showError(e); busy = false; }
+}
+
+async function act(kind) {
+  if (busy || !pair) return;
+  if (kind === 'tie')  return submit('tie');
+  if (kind === 'skip') { busy = true; return loadPair(); }
+  const side = kind === 'skip-a' ? 'a' : 'b';
+  busy = true;
+  try {
+    await api('mark', { id: pair[side].id, status: 'excluded' }, true);
+    loadPair();
+  } catch (e) { showError(e); busy = false; }
+}
+
+document.addEventListener('keydown', e => {
+  if (view !== 'duel' || busy) return;
+  if (e.target.matches('input,textarea')) return;
+  if (e.key === 'ArrowLeft')  submit('a');
+  if (e.key === 'ArrowRight') submit('b');
+  if (e.key.toLowerCase() === 't') submit('tie');
+  if (e.key.toLowerCase() === 's') { busy = true; loadPair(); }
+});
+
+// ---------------------------------------------------------------- board
+
+async function loadBoard() {
+  $('#boardBody').innerHTML = '<p class="loading">Loading…</p>';
+  $('#splitBody').innerHTML = '';
+  try {
+    const d = await api('board');
+    if (!d.board.length) {
+      $('#boardStats').textContent = 'Rankings';
+      $('#boardBody').innerHTML = '<p class="note"><strong>Nothing ranked yet.</strong><br>Judge a few matchups and the order shows up here.</p>';
+      return;
+    }
+    $('#boardStats').innerHTML = `<b>${d.board.length}</b> places ranked · one list, both of you`;
+
+    $('#boardBody').innerHTML = '<ol class="board">' + d.board.map((r, i) => `
+      <li>
+        <span class="pos">${i + 1}</span>
+        <span>
+          <span class="name">${escapeHTML(r.name)}</span><br>
+          <span class="sub">${escapeHTML([r.cuisine, r.address].filter(Boolean).join(' · '))}
+          ${r.photoFinish ? ' · <span class="disagree">too close to call</span>' : ''}</span>
+        </span>
+        <span class="score">${r.elo}<small>${r.matches} matchup${r.matches === 1 ? '' : 's'}</small></span>
+      </li>`).join('') + '</ol>';
+
+    if (d.splits && d.splits.length) {
+      $('#splitBody').innerHTML = `
+        <p class="eyebrow" style="margin:38px 0 14px">Split decisions · <b>${d.splits.length}</b></p>
+        <ul class="splits">` + d.splits.map(s => `
+          <li>
+            <span class="matchup">${escapeHTML(s.a)} <em>vs</em> ${escapeHTML(s.b)}</span>
+            <span class="verdicts">${s.picks.map(p =>
+              `${escapeHTML(p.user)} said <strong>${escapeHTML(p.pick)}</strong>`).join(' · ')}</span>
+          </li>`).join('') + '</ul>';
+    }
+  } catch (e) { showError(e, '#boardBody'); }
+}
+
+// ---------------------------------------------------------------- prune
+
+async function loadPrune() {
+  $('#pruneBody').innerHTML = '<p class="loading">Loading…</p>';
+  try {
+    const d = await api('list');
+    listCache = d.items;
+    drawPrune();
+  } catch (e) { showError(e, '#pruneBody'); }
+}
+
+function drawPrune() {
+  const q = $('#pruneSearch').value.trim().toLowerCase();
+  const items = listCache.filter(r => !q || r.name.toLowerCase().includes(q));
+  $('#pruneBody').innerHTML = '<ul class="prune">' + items.map(r => `
+    <li class="${r.status === 'excluded' ? 'off' : ''}" data-id="${r.id}">
+      <span class="name">${escapeHTML(r.name)}</span>
+      <button class="tiny" data-toggle="${r.id}">${r.status === 'excluded' ? 'Add back' : 'Never been'}</button>
+    </li>`).join('') + '</ul>';
+
+  $('#pruneBody').querySelectorAll('[data-toggle]').forEach(b =>
+    b.addEventListener('click', async () => {
+      const item = listCache.find(x => x.id === b.dataset.toggle);
+      const next = item.status === 'excluded' ? 'active' : 'excluded';
+      b.disabled = true;
+      try {
+        await api('mark', { id: item.id, status: next }, true);
+        item.status = next;
+        drawPrune();
+      } catch (e) { showError(e, '#pruneBody'); }
+    }));
+}
+
+$('#pruneSearch').addEventListener('input', () => { if (listCache.length) drawPrune(); });
+
+// ---------------------------------------------------------------- misc
+
+function short(name) { return name.length > 22 ? name.slice(0, 21) + '…' : name; }
+function escapeHTML(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+function showError(err, target = '#duelBody') {
+  $(target).innerHTML = `<p class="note"><strong>That didn't go through.</strong><br>${escapeHTML(err.message)}</p>`;
+}
+
+// ---------------------------------------------------------------- boot
+
+(async function boot() {
+  if (API.startsWith('PASTE_')) {
+    $('#duelStats').textContent = 'Setup';
+    $('#duelBody').innerHTML =
+      `<p class="note"><strong>Point this page at your backend.</strong><br>
+       Open <code>index.html</code>, and replace <code>API</code> with your Apps Script
+       <code>/exec</code> URL and <code>SECRET</code> with the one from <code>Code.gs</code>.</p>`;
+    return;
+  }
+  try {
+    const cfg = await api('config');
+    users = cfg.users;
+    if (!users.includes(user)) user = users[0];
+    store.setItem('ts_user', user);
+    renderUserSeg();
+    loadPair();
+  } catch (e) { showError(e); }
+})();
+</script>
+</body>
+</html>
