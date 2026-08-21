@@ -85,7 +85,7 @@ main{max-width:960px;margin:0 auto;padding:26px 20px 72px}
   position:relative;display:flex;flex-direction:column;text-align:left;
   background:var(--paper);border:1px solid var(--line);border-radius:4px;
   box-shadow:var(--shadow);
-  padding:26px 22px 20px;cursor:pointer;
+  padding:0;overflow:hidden;cursor:pointer;
   font:inherit;color:inherit;appearance:none;
   transition:transform .16s ease, box-shadow .16s ease, border-color .16s ease;
 }
@@ -93,6 +93,34 @@ main{max-width:960px;margin:0 auto;padding:26px 20px 72px}
 .card:focus-visible{outline:2px solid var(--quartz);outline-offset:3px}
 .card.win{border-color:var(--prairie);transform:translateY(-6px)}
 .card.lose{opacity:.42;transform:scale(.98)}
+
+.card .body{
+  display:flex;flex-direction:column;flex:1;
+  padding:22px 22px 18px;
+}
+
+/* Fixed frame so every card is the same height whatever the source image is.
+   The monogram sits underneath and shows through when there's no photo, or
+   when one fails to load and the img removes itself. */
+.card .photo{
+  position:relative;aspect-ratio:16/10;overflow:hidden;
+  background:var(--tint,var(--quartz));border-bottom:1px solid var(--line);
+}
+.card .photo::after{
+  content:attr(data-mono);position:absolute;inset:0;
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--display);font-weight:800;font-variation-settings:"wdth" 84;
+  font-size:clamp(30px,7vw,46px);letter-spacing:-.03em;
+  color:rgba(253,250,248,.86);
+}
+.card .photo img{
+  position:relative;z-index:1;
+  width:100%;height:100%;object-fit:cover;display:block;
+}
+.card .photo.t0{--tint:#A8455E}
+.card .photo.t1{--tint:#456B52}
+.card .photo.t2{--tint:#B07C2E}
+.card .photo.t3{--tint:#4A3D52}
 
 .card .rank{
   font-family:var(--mono);font-size:10px;letter-spacing:.14em;
@@ -111,14 +139,15 @@ main{max-width:960px;margin:0 auto;padding:26px 20px 72px}
 .card .foot .elo{font-size:15px;font-weight:600;color:var(--ink)}
 
 .delta{
-  position:absolute;top:14px;right:16px;
+  position:absolute;top:12px;right:12px;z-index:2;
   font-family:var(--mono);font-size:13px;font-weight:600;
-  padding:3px 8px;border-radius:3px;opacity:0;transform:translateY(4px);
+  padding:4px 9px;border-radius:3px;opacity:0;transform:translateY(4px);
+  box-shadow:0 2px 10px -4px rgba(36,26,32,.6);
   transition:opacity .2s ease,transform .2s ease;
 }
 .delta.show{opacity:1;transform:translateY(0)}
-.delta.up{background:rgba(69,107,82,.14);color:var(--prairie)}
-.delta.down{background:rgba(168,69,94,.12);color:var(--quartz)}
+.delta.up{background:var(--prairie);color:var(--paper)}
+.delta.down{background:var(--paper);color:var(--quartz);border:1px solid var(--line)}
 
 .versus{
   display:flex;align-items:center;justify-content:center;
@@ -233,7 +262,8 @@ main{max-width:960px;margin:0 auto;padding:26px 20px 72px}
 @media (max-width:680px){
   .duel{grid-template-columns:1fr;gap:10px}
   .versus{writing-mode:horizontal-tb;padding:2px 0}
-  .card{padding:20px 18px 16px}
+  .card .body{padding:18px 18px 14px}
+  .card .photo{aspect-ratio:2/1}
   .card .foot{padding-top:14px}
 }
 @media (prefers-reduced-motion:reduce){
@@ -343,14 +373,39 @@ function renderUserSeg() {
 // ---------------------------------------------------------------- duel
 
 function cardHTML(side, c) {
+  const img = c.photo
+    ? `<img src="${escapeHTML(c.photo)}" alt="" loading="eager" referrerpolicy="no-referrer"
+           onerror="this.remove()">`
+    : '';
   return `
   <button class="card" data-side="${side}">
-    <div class="rank">${side === 'a' ? 'Left' : 'Right'}${c.matches ? ' · ' + c.matches + ' matchup' + (c.matches === 1 ? '' : 's') : ' · never rated'}</div>
-    <h2>${escapeHTML(c.name)}</h2>
-    <p class="meta">${escapeHTML([c.cuisine, c.address].filter(Boolean).join(' · ')) || '&nbsp;'}</p>
-    <div class="foot"><span class="elo">${c.elo}</span><span>rating</span></div>
+    <div class="photo t${tintFor(c.name)}" data-mono="${escapeHTML(monogram(c.name))}">${img}</div>
+    <div class="body">
+      <div class="rank">${side === 'a' ? 'Left' : 'Right'}${c.matches ? ' · ' + c.matches + ' matchup' + (c.matches === 1 ? '' : 's') : ' · never rated'}</div>
+      <h2>${escapeHTML(c.name)}</h2>
+      <p class="meta">${escapeHTML([c.cuisine, c.address].filter(Boolean).join(' · ')) || '&nbsp;'}</p>
+      <div class="foot"><span class="elo">${c.elo}</span><span>rating</span></div>
+    </div>
     <div class="delta" data-delta="${side}"></div>
   </button>`;
+}
+
+/** Up to two initials, so the placeholder reads as a monogram rather than a blank. */
+function monogram(name) {
+  const words = String(name || '?')
+    .replace(/[^\p{L}\p{N} ]/gu, ' ')
+    .split(/\s+/)
+    .filter(w => w && !/^(the|a|of|and|on|at|by)$/i.test(w));
+  if (!words.length) return '?';
+  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+  return (words[0][0] + words[1][0]).toUpperCase();
+}
+
+/** Stable per-restaurant tint, so a place looks the same every time it appears. */
+function tintFor(name) {
+  let h = 0;
+  for (const ch of String(name || '')) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  return h % 4;
 }
 
 function renderPair(p) {
