@@ -1,607 +1,1037 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Table Stakes</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,400..800&family=IBM+Plex+Mono:wght@400;500;600&family=Inter+Tight:wght@400;500;600&display=swap" rel="stylesheet">
-<style>
-:root{
-  --stone:#EDE4E2;
-  --paper:#FDFAF8;
-  --ink:#241A20;
-  --ink-soft:#6B5A60;
-  --quartz:#A8455E;
-  --prairie:#456B52;
-  --amber:#D8A03C;
-  --line:rgba(36,26,32,.14);
-  --shadow:0 1px 0 rgba(36,26,32,.09), 0 12px 28px -18px rgba(36,26,32,.5);
-  --display:"Bricolage Grotesque",system-ui,sans-serif;
-  --body:"Inter Tight",system-ui,sans-serif;
-  --mono:"IBM Plex Mono",ui-monospace,monospace;
+/**
+ * Table Stakes — restaurant Elo backend (shared ratings)
+ * Google Apps Script, bound to a Google Sheet.
+ *
+ * One rating per restaurant. Both of you vote into the same numbers.
+ * The only per-person thing is the "never been" list, so you each get
+ * matchups you can actually judge.
+ *
+ * Setup order:
+ *   1. Edit CONFIG below (SECRET, USERS, BBOX if you're not in Sioux Falls).
+ *   2. Run setup()              -> creates the four tabs.
+ *   3. Run importFromOverpass() -> pulls restaurants from OpenStreetMap (free, no key).
+ *   4. Run syncRatings()        -> creates one rating row per active restaurant.
+ *   5. Deploy > New deployment > Web app
+ *        Execute as: Me
+ *        Who has access: Anyone
+ *      Copy the /exec URL into index.html.
+ */
+
+// ---------------------------------------------------------------- config
+
+const CONFIG = {
+  // Shared password. It lives in your public JS, so treat it as a speed bump,
+  // not security. Change it if strangers start voting.
+  SECRET: 'CHANGE_ME_TO_SOMETHING_RANDOM',
+
+  USERS: ['Berk', 'Keeley'],
+
+  START_ELO: 1500,
+
+  // Sioux Falls bounding box (south, west, north, east)
+  BBOX: { s: 43.45, w: -96.87, n: 43.63, e: -96.62 },
+
+  // Tried in order. The main instance blocks a lot of cloud IP ranges, and
+  // Apps Script runs from Google's, so the mirrors are often the ones that work.
+  OVERPASS: [
+    'https://overpass.private.coffee/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+    'https://overpass-api.de/api/interpreter',
+  ],
+  AMENITIES: ['restaurant', 'fast_food', 'cafe'],
+
+  // Don't re-show a pairing until this many total votes have passed.
+  RECENT_PAIR_MEMORY: 60,
+
+  // Fraction of pairings that ignore Elo proximity, to keep the graph connected.
+  EXPLORE_RATE: 0.2,
+
+  // Rating gap small enough that the board order isn't really settled.
+  PHOTO_FINISH: 15,
+
+  // --- bracket ---
+  BRACKET_SIZE: 8,        // must be a power of two
+  ALTERNATES: 4,          // spares offered when you haven't been somewhere
+  CATEGORY_CAP: 2,        // max entrants per category, so a field isn't all pizza
+
+  // --- rankings ---
+  // A place needs this many matchups before it can appear in the rankings.
+  // At 1, everything shows up the moment it plays its first bracket match —
+  // the early list is noisy by design, so you can watch it settle.
+  MIN_MATCHES_RANKED: 1,
+  TOP_FRACTION: 0.5,      // show the top half
+
+  // Bucket for restaurants with an empty cuisine cell.
+  UNCATEGORIZED: 'Uncategorized',
+};
+
+const SHEETS = { R: 'Restaurants', T: 'Ratings', S: 'Skips', M: 'Matches', B: 'Brackets' };
+
+const HEADERS = {
+  Restaurants: ['id', 'name', 'address', 'cuisine', 'lat', 'lng', 'source', 'source_id', 'active', 'added_at', 'photo'],
+  Ratings: ['restaurant_id', 'elo', 'matches', 'wins', 'losses', 'ties', 'updated_at'],
+  Skips: ['user', 'restaurant_id', 'added_at'],
+  Matches: ['timestamp', 'user', 'a_id', 'b_id', 'result', 'a_before', 'b_before', 'a_after', 'b_after'],
+  Brackets: ['timestamp', 'user', 'champion_id', 'runner_up_id', 'field_ids'],
+};
+
+// ---------------------------------------------------------------- setup
+
+function setup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  Object.keys(HEADERS).forEach(function (name) {
+    let sh = ss.getSheetByName(name);
+    if (!sh) sh = ss.insertSheet(name);
+    const head = HEADERS[name];
+    sh.getRange(1, 1, 1, head.length).setValues([head]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  });
+  Logger.log('Sheets ready. Next: run importFromOverpass().');
 }
 
-*{box-sizing:border-box}
-html,body{margin:0}
-body{
-  background:var(--stone);
-  color:var(--ink);
-  font-family:var(--body);
-  font-size:16px;
-  line-height:1.45;
-  -webkit-font-smoothing:antialiased;
-  min-height:100vh;
+// ---------------------------------------------------------------- import
+
+/**
+ * Pull restaurants, fast food and cafes from OpenStreetMap via Overpass.
+ * Free, no API key, no caching restrictions. Coverage is good in town and
+ * thinner on brand-new places — add those by hand in the Restaurants tab.
+ */
+function importFromOverpass() {
+  const b = CONFIG.BBOX;
+  const box = [b.s, b.w, b.n, b.e].join(',');
+  const clauses = CONFIG.AMENITIES.map(function (a) {
+    return 'node["amenity"="' + a + '"]["name"](' + box + ');' +
+           'way["amenity"="' + a + '"]["name"](' + box + ');';
+  }).join('');
+  const query = '[out:json][timeout:90];(' + clauses + ');out center tags;';
+
+  const elements = JSON.parse(overpassFetch_(query)).elements || [];
+  const found = elements.map(function (el) {
+    const t = el.tags || {};
+    const street = [t['addr:housenumber'], t['addr:street']].filter(Boolean).join(' ');
+    const address = [street, t['addr:city']].filter(Boolean).join(', ');
+    return {
+      name: t.name,
+      address: address,
+      cuisine: (t.cuisine || t.amenity || '').replace(/;/g, ', ').replace(/_/g, ' '),
+      lat: el.lat != null ? el.lat : (el.center ? el.center.lat : ''),
+      lng: el.lon != null ? el.lon : (el.center ? el.center.lon : ''),
+      source: 'osm',
+      source_id: el.type + '/' + el.id,
+    };
+  }).filter(function (r) { return r.name; });
+
+  const added = upsertRestaurants_(found);
+  Logger.log('Overpass returned %s places; %s new rows added.', found.length, added);
+  return added;
 }
 
-/* ---------------------------------------------------------- top bar */
+/**
+ * Walk the mirror list until one answers. Returns the raw response body.
+ *
+ * "Address unavailable" from UrlFetchApp is a connection-level failure — DNS
+ * or a refused socket — not an HTTP status, so it throws instead of returning
+ * a code. Either way we just move to the next mirror.
+ */
+function overpassFetch_(query) {
+  const problems = [];
 
-.topbar{
-  display:flex;align-items:center;gap:16px;flex-wrap:wrap;
-  padding:14px 20px;border-bottom:1px solid var(--line);
-  background:color-mix(in srgb,var(--stone) 80%,white);
-  position:sticky;top:0;z-index:10;
-  backdrop-filter:blur(6px);
-}
-.wordmark{
-  font-family:var(--display);
-  font-weight:800;font-size:19px;letter-spacing:-.02em;
-  font-variation-settings:"wdth" 82;
-  margin-right:auto;display:flex;align-items:baseline;gap:8px;
-}
-.wordmark span{
-  font-family:var(--mono);font-size:10px;font-weight:500;
-  letter-spacing:.14em;text-transform:uppercase;color:var(--quartz);
-}
-
-.seg{display:flex;border:1px solid var(--line);border-radius:999px;overflow:hidden;background:var(--paper)}
-.seg button{
-  appearance:none;border:0;background:transparent;cursor:pointer;
-  font-family:var(--mono);font-size:11px;font-weight:500;
-  letter-spacing:.09em;text-transform:uppercase;
-  padding:7px 13px;color:var(--ink-soft);
-}
-.seg button[aria-pressed="true"]{background:var(--ink);color:var(--paper)}
-.seg button:focus-visible{outline:2px solid var(--quartz);outline-offset:-2px}
-
-/* ---------------------------------------------------------- shell */
-
-main{max-width:960px;margin:0 auto;padding:26px 20px 72px}
-.view[hidden]{display:none}
-
-.eyebrow{
-  font-family:var(--mono);font-size:11px;font-weight:500;
-  letter-spacing:.13em;text-transform:uppercase;color:var(--ink-soft);
-  margin:0 0 18px;
-}
-.eyebrow b{color:var(--quartz);font-weight:600}
-
-/* ---------------------------------------------------------- duel */
-
-.duel{display:grid;grid-template-columns:1fr auto 1fr;gap:14px;align-items:stretch}
-
-.card{
-  position:relative;display:flex;flex-direction:column;text-align:left;
-  background:var(--paper);border:1px solid var(--line);border-radius:4px;
-  box-shadow:var(--shadow);
-  padding:0;overflow:hidden;cursor:pointer;
-  font:inherit;color:inherit;appearance:none;
-  transition:transform .16s ease, box-shadow .16s ease, border-color .16s ease;
-}
-.card:hover{transform:translateY(-3px);border-color:rgba(168,69,94,.45)}
-.card:focus-visible{outline:2px solid var(--quartz);outline-offset:3px}
-.card.win{border-color:var(--prairie);transform:translateY(-6px)}
-.card.lose{opacity:.42;transform:scale(.98)}
-
-.card .body{
-  display:flex;flex-direction:column;flex:1;
-  padding:22px 22px 18px;
-}
-
-/* Fixed frame so every card is the same height whatever the source image is.
-   The monogram sits underneath and shows through when there's no photo, or
-   when one fails to load and the img removes itself. */
-.card .photo{
-  position:relative;aspect-ratio:16/10;overflow:hidden;
-  background:var(--tint,var(--quartz));border-bottom:1px solid var(--line);
-}
-.card .photo::after{
-  content:attr(data-mono);position:absolute;inset:0;
-  display:flex;align-items:center;justify-content:center;
-  font-family:var(--display);font-weight:800;font-variation-settings:"wdth" 84;
-  font-size:clamp(30px,7vw,46px);letter-spacing:-.03em;
-  color:rgba(253,250,248,.86);
-}
-.card .photo img{
-  position:relative;z-index:1;
-  width:100%;height:100%;object-fit:cover;display:block;
-}
-.card .photo.t0{--tint:#A8455E}
-.card .photo.t1{--tint:#456B52}
-.card .photo.t2{--tint:#B07C2E}
-.card .photo.t3{--tint:#4A3D52}
-
-.card .rank{
-  font-family:var(--mono);font-size:10px;letter-spacing:.14em;
-  text-transform:uppercase;color:var(--ink-soft);margin-bottom:12px;
-}
-.card h2{
-  font-family:var(--display);font-weight:700;font-variation-settings:"wdth" 88;
-  font-size:clamp(24px,4.4vw,34px);line-height:1.05;letter-spacing:-.02em;
-  margin:0 0 10px;
-}
-.card .meta{font-size:13.5px;color:var(--ink-soft);margin:0}
-.card .foot{
-  display:flex;align-items:baseline;gap:10px;margin-top:auto;padding-top:22px;
-  font-family:var(--mono);font-size:12px;color:var(--ink-soft);
-}
-.card .foot .elo{font-size:15px;font-weight:600;color:var(--ink)}
-
-.delta{
-  position:absolute;top:12px;right:12px;z-index:2;
-  font-family:var(--mono);font-size:13px;font-weight:600;
-  padding:4px 9px;border-radius:3px;opacity:0;transform:translateY(4px);
-  box-shadow:0 2px 10px -4px rgba(36,26,32,.6);
-  transition:opacity .2s ease,transform .2s ease;
-}
-.delta.show{opacity:1;transform:translateY(0)}
-.delta.up{background:var(--prairie);color:var(--paper)}
-.delta.down{background:var(--paper);color:var(--quartz);border:1px solid var(--line)}
-
-.versus{
-  display:flex;align-items:center;justify-content:center;
-  font-family:var(--display);font-weight:800;font-size:13px;
-  letter-spacing:.1em;color:var(--quartz);
-  writing-mode:vertical-rl;padding:0 2px;
-}
-
-/* signature: the odds bar */
-.odds{margin-top:20px}
-.odds-track{
-  display:flex;height:8px;border-radius:999px;overflow:hidden;
-  background:var(--line);border:1px solid var(--line);
-}
-.odds-track i{display:block;transition:width .5s cubic-bezier(.4,0,.2,1)}
-.odds-track i.left{background:var(--quartz)}
-.odds-track i.right{background:var(--ink)}
-.odds-legend{
-  display:flex;justify-content:space-between;gap:12px;margin-top:8px;
-  font-family:var(--mono);font-size:11px;letter-spacing:.06em;color:var(--ink-soft);
-}
-.odds-note{margin:10px 0 0;font-size:13px;color:var(--ink-soft)}
-
-.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
-.btn{
-  appearance:none;font:inherit;cursor:pointer;
-  background:transparent;border:1px solid var(--line);border-radius:999px;
-  padding:8px 15px;font-size:13.5px;color:var(--ink);
-  transition:background .15s ease,border-color .15s ease;
-}
-.btn:hover{background:var(--paper);border-color:rgba(36,26,32,.32)}
-.btn:focus-visible{outline:2px solid var(--quartz);outline-offset:2px}
-.btn.strong{background:var(--ink);color:var(--paper);border-color:var(--ink)}
-.btn.quiet{color:var(--ink-soft)}
-
-.keys{
-  margin-top:18px;font-family:var(--mono);font-size:11px;
-  letter-spacing:.06em;color:var(--ink-soft);
-}
-.keys kbd{
-  font-family:var(--mono);background:var(--paper);
-  border:1px solid var(--line);border-bottom-width:2px;border-radius:3px;
-  padding:1px 5px;font-size:10px;
-}
-
-/* ---------------------------------------------------------- board */
-
-.board{list-style:none;margin:0;padding:0}
-.board li{
-  display:grid;grid-template-columns:38px 1fr auto;gap:14px;align-items:baseline;
-  padding:12px 4px;border-bottom:1px solid var(--line);
-}
-.board li:first-child .name{font-size:20px}
-.board .pos{font-family:var(--mono);font-size:13px;color:var(--ink-soft)}
-.board li:nth-child(-n+3) .pos{color:var(--quartz);font-weight:600}
-.board .name{
-  font-family:var(--display);font-weight:600;font-variation-settings:"wdth" 90;
-  font-size:17px;letter-spacing:-.01em;
-}
-.board .sub{font-size:12.5px;color:var(--ink-soft);font-family:var(--body)}
-.board .score{font-family:var(--mono);font-size:15px;font-weight:600;text-align:right}
-.board .score small{display:block;font-weight:400;font-size:11px;color:var(--ink-soft)}
-.disagree{color:var(--amber);font-weight:600}
-
-.splits{list-style:none;margin:0;padding:0}
-.splits li{
-  padding:12px 4px;border-bottom:1px solid var(--line);
-  display:flex;flex-wrap:wrap;gap:4px 16px;align-items:baseline;
-}
-.splits .matchup{
-  font-family:var(--display);font-weight:600;font-variation-settings:"wdth" 90;
-  font-size:16px;flex:1 1 260px;
-}
-.splits .matchup em{
-  font-style:normal;font-family:var(--mono);font-size:11px;
-  letter-spacing:.1em;text-transform:uppercase;color:var(--quartz);margin:0 4px;
-}
-.splits .verdicts{font-size:13px;color:var(--ink-soft)}
-.splits .verdicts strong{color:var(--ink);font-weight:600}
-
-/* ---------------------------------------------------------- prune */
-
-.search{
-  width:100%;padding:10px 14px;font:inherit;
-  border:1px solid var(--line);border-radius:4px;background:var(--paper);
-  margin-bottom:16px;
-}
-.search:focus-visible{outline:2px solid var(--quartz);outline-offset:-1px}
-.prune{list-style:none;margin:0;padding:0}
-.prune li{
-  display:flex;align-items:center;gap:12px;
-  padding:9px 4px;border-bottom:1px solid var(--line);
-}
-.prune .name{flex:1;font-size:15px}
-.prune li.off .name{color:var(--ink-soft);text-decoration:line-through}
-.prune .tiny{
-  font-family:var(--mono);font-size:11px;letter-spacing:.06em;
-  text-transform:uppercase;padding:5px 10px;border-radius:999px;
-  border:1px solid var(--line);background:transparent;cursor:pointer;color:var(--ink-soft);
-}
-.prune .tiny:hover{background:var(--paper)}
-
-/* ---------------------------------------------------------- states */
-
-.note{
-  background:var(--paper);border:1px solid var(--line);border-left:3px solid var(--quartz);
-  border-radius:3px;padding:16px 18px;font-size:14.5px;
-}
-.note code{font-family:var(--mono);font-size:12.5px;background:var(--stone);padding:1px 5px;border-radius:2px}
-.loading{font-family:var(--mono);font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-soft)}
-
-@media (max-width:680px){
-  .duel{grid-template-columns:1fr;gap:10px}
-  .versus{writing-mode:horizontal-tb;padding:2px 0}
-  .card .body{padding:18px 18px 14px}
-  .card .photo{aspect-ratio:2/1}
-  .card .foot{padding-top:14px}
-}
-@media (prefers-reduced-motion:reduce){
-  *{transition:none!important;animation:none!important}
-}
-</style>
-</head>
-<body>
-
-<div class="topbar">
-  <div class="wordmark">Table Stakes <span>Sioux Falls</span></div>
-  <div class="seg" id="userSeg" role="group" aria-label="Who's voting"></div>
-  <div class="seg" role="group" aria-label="View">
-    <button data-view="duel" aria-pressed="true">Rate</button>
-    <button data-view="board" aria-pressed="false">Rankings</button>
-    <button data-view="prune" aria-pressed="false">List</button>
-  </div>
-</div>
-
-<main>
-  <!-- Rate ------------------------------------------------------------ -->
-  <section class="view" id="view-duel">
-    <p class="eyebrow" id="duelStats">Loading…</p>
-    <div id="duelBody"></div>
-  </section>
-
-  <!-- Rankings -------------------------------------------------------- -->
-  <section class="view" id="view-board" hidden>
-    <p class="eyebrow" id="boardStats">Rankings</p>
-    <div id="boardBody"><p class="loading">Loading…</p></div>
-    <div id="splitBody"></div>
-  </section>
-
-  <!-- List ------------------------------------------------------------ -->
-  <section class="view" id="view-prune" hidden>
-    <p class="eyebrow">Turn off anywhere you haven't eaten. It stops showing up in your matchups.</p>
-    <input class="search" id="pruneSearch" type="search" placeholder="Search restaurants" autocomplete="off">
-    <div id="pruneBody"><p class="loading">Loading…</p></div>
-  </section>
-</main>
-
-<script>
-// ============================================================ CONFIGURE ME
-const API    = 'https://script.google.com/macros/s/AKfycbz5S-KLqc33oKJNmgrhakvBwnW0zpF7rm7t4YzQvN65IbJT7WXDjCH79pLOK-fIyxH8Dw/exec';
-const SECRET = 'CHANGE_ME_TO_SOMETHING_RANDOM';
-// ==========================================================================
-
-const store = (() => {
-  try { localStorage.setItem('__t','1'); localStorage.removeItem('__t');
-        return localStorage; } catch (e) { const m={}; return {
-        getItem:k=>k in m?m[k]:null, setItem:(k,v)=>{m[k]=String(v)} }; }
-})();
-
-let users = [];
-let user  = store.getItem('ts_user') || '';
-let view  = 'duel';
-let pair  = null;
-let busy  = false;
-let listCache = [];
-
-const $ = s => document.querySelector(s);
-
-async function api(action, params = {}, write = false) {
-  const payload = Object.assign({ action, secret: SECRET, user }, params);
-  let res;
-  if (write) {
-    // No Content-Type header on purpose: keeps this a "simple request" so the
-    // browser skips the CORS preflight that Apps Script can't answer.
-    res = await fetch(API, { method: 'POST', body: JSON.stringify(payload) });
-  } else {
-    const qs = new URLSearchParams(payload).toString();
-    res = await fetch(API + '?' + qs);
-  }
-  const data = await res.json();
-  if (!data.ok) throw new Error(data.error || 'Request failed');
-  return data;
-}
-
-// ---------------------------------------------------------------- chrome
-
-function setView(next) {
-  view = next;
-  document.querySelectorAll('[data-view]').forEach(b =>
-    b.setAttribute('aria-pressed', String(b.dataset.view === next)));
-  ['duel','board','prune'].forEach(v =>
-    $('#view-' + v).hidden = v !== next);
-  if (next === 'board') loadBoard();
-  if (next === 'prune') loadPrune();
-}
-
-document.querySelectorAll('[data-view]').forEach(b =>
-  b.addEventListener('click', () => setView(b.dataset.view)));
-
-function renderUserSeg() {
-  $('#userSeg').innerHTML = users.map(u =>
-    `<button data-user="${u}" aria-pressed="${u === user}">${u}</button>`).join('');
-  $('#userSeg').querySelectorAll('button').forEach(b =>
-    b.addEventListener('click', () => {
-      user = b.dataset.user;
-      store.setItem('ts_user', user);
-      renderUserSeg();
-      loadPair();
-      if (view === 'prune') loadPrune();
-    }));
-}
-
-// ---------------------------------------------------------------- duel
-
-function cardHTML(side, c) {
-  const img = c.photo
-    ? `<img src="${escapeHTML(c.photo)}" alt="" loading="eager" referrerpolicy="no-referrer"
-           onerror="this.remove()">`
-    : '';
-  return `
-  <button class="card" data-side="${side}">
-    <div class="photo t${tintFor(c.name)}" data-mono="${escapeHTML(monogram(c.name))}">${img}</div>
-    <div class="body">
-      <div class="rank">${side === 'a' ? 'Left' : 'Right'}${c.matches ? ' · ' + c.matches + ' matchup' + (c.matches === 1 ? '' : 's') : ' · never rated'}</div>
-      <h2>${escapeHTML(c.name)}</h2>
-      <p class="meta">${escapeHTML([c.cuisine, c.address].filter(Boolean).join(' · ')) || '&nbsp;'}</p>
-      <div class="foot"><span class="elo">${c.elo}</span><span>rating</span></div>
-    </div>
-    <div class="delta" data-delta="${side}"></div>
-  </button>`;
-}
-
-/** Up to two initials, so the placeholder reads as a monogram rather than a blank. */
-function monogram(name) {
-  const words = String(name || '?')
-    .replace(/[^\p{L}\p{N} ]/gu, ' ')
-    .split(/\s+/)
-    .filter(w => w && !/^(the|a|of|and|on|at|by)$/i.test(w));
-  if (!words.length) return '?';
-  if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
-  return (words[0][0] + words[1][0]).toUpperCase();
-}
-
-/** Stable per-restaurant tint, so a place looks the same every time it appears. */
-function tintFor(name) {
-  let h = 0;
-  for (const ch of String(name || '')) h = (h * 31 + ch.codePointAt(0)) >>> 0;
-  return h % 4;
-}
-
-function renderPair(p) {
-  const pctA = Math.round(p.expectedA * 100);
-  const fav  = pctA >= 50 ? p.a : p.b;
-  const favP = Math.max(pctA, 100 - pctA);
-
-  $('#duelBody').innerHTML = `
-    <div class="duel">
-      ${cardHTML('a', p.a)}
-      <div class="versus">vs</div>
-      ${cardHTML('b', p.b)}
-    </div>
-    <div class="odds">
-      <div class="odds-track">
-        <i class="left" style="width:${pctA}%"></i>
-        <i class="right" style="width:${100 - pctA}%"></i>
-      </div>
-      <div class="odds-legend"><span>${pctA}%</span><span>${100 - pctA}%</span></div>
-      <p class="odds-note">${favP === 50
-        ? 'Dead even on the list so far. Your call breaks it.'
-        : `The list so far favors <strong>${escapeHTML(fav.name)}</strong> here.`}</p>
-    </div>
-    <div class="actions">
-      <button class="btn strong" data-act="tie">Too close to call</button>
-      <button class="btn" data-act="skip-a">Never been to ${escapeHTML(short(p.a.name))}</button>
-      <button class="btn" data-act="skip-b">Never been to ${escapeHTML(short(p.b.name))}</button>
-      <button class="btn quiet" data-act="skip">Different pair</button>
-    </div>
-    <p class="keys"><kbd>←</kbd> left wins &nbsp; <kbd>→</kbd> right wins &nbsp; <kbd>T</kbd> tie &nbsp; <kbd>S</kbd> new pair</p>`;
-
-  $('#duelBody').querySelectorAll('.card').forEach(el =>
-    el.addEventListener('click', () => submit(el.dataset.side)));
-  $('#duelBody').querySelectorAll('[data-act]').forEach(el =>
-    el.addEventListener('click', () => act(el.dataset.act)));
-}
-
-async function loadPair() {
-  if (!user) return;
-  $('#duelStats').textContent = 'Finding a matchup…';
-  try {
-    const d = await api('pair');
-    pair = d.pair;
-    renderPair(pair);
-    const s = d.stats;
-    const contrib = Object.keys(s.byUser).map(u => `${u} ${s.byUser[u]}`).join(' · ');
-    $('#duelStats').innerHTML =
-      `<b>${s.votes}</b> matchups judged into one list (${escapeHTML(contrib)}) · ${s.untested} places still untested`;
-  } catch (e) {
-    showError(e);
-  } finally { busy = false; }
-}
-
-async function submit(result) {
-  if (busy || !pair) return;
-  busy = true;
-  const cards = { a: $('[data-side="a"]'), b: $('[data-side="b"]') };
-  try {
-    const d = await api('vote', { a: pair.a.id, b: pair.b.id, result }, true);
-    ['a','b'].forEach(side => {
-      const won = result === side;
-      cards[side].classList.add(result === 'tie' ? 'win' : (won ? 'win' : 'lose'));
-      const delta = d[side].delta;
-      const chip = cards[side].querySelector('[data-delta]');
-      chip.textContent = (delta >= 0 ? '+' : '') + delta;
-      chip.className = 'delta show ' + (delta >= 0 ? 'up' : 'down');
-    });
-    setTimeout(loadPair, 620);
-  } catch (e) { showError(e); busy = false; }
-}
-
-async function act(kind) {
-  if (busy || !pair) return;
-  if (kind === 'tie')  return submit('tie');
-  if (kind === 'skip') { busy = true; return loadPair(); }
-  const side = kind === 'skip-a' ? 'a' : 'b';
-  busy = true;
-  try {
-    await api('mark', { id: pair[side].id, status: 'excluded' }, true);
-    loadPair();
-  } catch (e) { showError(e); busy = false; }
-}
-
-document.addEventListener('keydown', e => {
-  if (view !== 'duel' || busy) return;
-  if (e.target.matches('input,textarea')) return;
-  if (e.key === 'ArrowLeft')  submit('a');
-  if (e.key === 'ArrowRight') submit('b');
-  if (e.key.toLowerCase() === 't') submit('tie');
-  if (e.key.toLowerCase() === 's') { busy = true; loadPair(); }
-});
-
-// ---------------------------------------------------------------- board
-
-async function loadBoard() {
-  $('#boardBody').innerHTML = '<p class="loading">Loading…</p>';
-  $('#splitBody').innerHTML = '';
-  try {
-    const d = await api('board');
-    if (!d.board.length) {
-      $('#boardStats').textContent = 'Rankings';
-      $('#boardBody').innerHTML = '<p class="note"><strong>Nothing ranked yet.</strong><br>Judge a few matchups and the order shows up here.</p>';
-      return;
-    }
-    $('#boardStats').innerHTML = `<b>${d.board.length}</b> places ranked · one list, both of you`;
-
-    $('#boardBody').innerHTML = '<ol class="board">' + d.board.map((r, i) => `
-      <li>
-        <span class="pos">${i + 1}</span>
-        <span>
-          <span class="name">${escapeHTML(r.name)}</span><br>
-          <span class="sub">${escapeHTML([r.cuisine, r.address].filter(Boolean).join(' · '))}
-          ${r.photoFinish ? ' · <span class="disagree">too close to call</span>' : ''}</span>
-        </span>
-        <span class="score">${r.elo}<small>${r.matches} matchup${r.matches === 1 ? '' : 's'}</small></span>
-      </li>`).join('') + '</ol>';
-
-    if (d.splits && d.splits.length) {
-      $('#splitBody').innerHTML = `
-        <p class="eyebrow" style="margin:38px 0 14px">Split decisions · <b>${d.splits.length}</b></p>
-        <ul class="splits">` + d.splits.map(s => `
-          <li>
-            <span class="matchup">${escapeHTML(s.a)} <em>vs</em> ${escapeHTML(s.b)}</span>
-            <span class="verdicts">${s.picks.map(p =>
-              `${escapeHTML(p.user)} said <strong>${escapeHTML(p.pick)}</strong>`).join(' · ')}</span>
-          </li>`).join('') + '</ul>';
-    }
-  } catch (e) { showError(e, '#boardBody'); }
-}
-
-// ---------------------------------------------------------------- prune
-
-async function loadPrune() {
-  $('#pruneBody').innerHTML = '<p class="loading">Loading…</p>';
-  try {
-    const d = await api('list');
-    listCache = d.items;
-    drawPrune();
-  } catch (e) { showError(e, '#pruneBody'); }
-}
-
-function drawPrune() {
-  const q = $('#pruneSearch').value.trim().toLowerCase();
-  const items = listCache.filter(r => !q || r.name.toLowerCase().includes(q));
-  $('#pruneBody').innerHTML = '<ul class="prune">' + items.map(r => `
-    <li class="${r.status === 'excluded' ? 'off' : ''}" data-id="${r.id}">
-      <span class="name">${escapeHTML(r.name)}</span>
-      <button class="tiny" data-toggle="${r.id}">${r.status === 'excluded' ? 'Add back' : 'Never been'}</button>
-    </li>`).join('') + '</ul>';
-
-  $('#pruneBody').querySelectorAll('[data-toggle]').forEach(b =>
-    b.addEventListener('click', async () => {
-      const item = listCache.find(x => x.id === b.dataset.toggle);
-      const next = item.status === 'excluded' ? 'active' : 'excluded';
-      b.disabled = true;
+  for (let i = 0; i < CONFIG.OVERPASS.length; i++) {
+    const url = CONFIG.OVERPASS[i];
+    for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await api('mark', { id: item.id, status: next }, true);
-        item.status = next;
-        drawPrune();
-      } catch (e) { showError(e, '#pruneBody'); }
-    }));
-}
-
-$('#pruneSearch').addEventListener('input', () => { if (listCache.length) drawPrune(); });
-
-// ---------------------------------------------------------------- misc
-
-function short(name) { return name.length > 22 ? name.slice(0, 21) + '…' : name; }
-function escapeHTML(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g,
-    c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
-}
-function showError(err, target = '#duelBody') {
-  $(target).innerHTML = `<p class="note"><strong>That didn't go through.</strong><br>${escapeHTML(err.message)}</p>`;
-}
-
-// ---------------------------------------------------------------- boot
-
-(async function boot() {
-  if (API.startsWith('PASTE_')) {
-    $('#duelStats').textContent = 'Setup';
-    $('#duelBody').innerHTML =
-      `<p class="note"><strong>Point this page at your backend.</strong><br>
-       Open <code>index.html</code>, and replace <code>API</code> with your Apps Script
-       <code>/exec</code> URL and <code>SECRET</code> with the one from <code>Code.gs</code>.</p>`;
-    return;
+        const res = UrlFetchApp.fetch(url, {
+          method: 'post',
+          payload: { data: query },
+          muteHttpExceptions: true,
+          followRedirects: true,
+          headers: {
+            // Overpass asks that clients identify themselves.
+            'User-Agent': 'TableStakes/1.0 (personal restaurant ranking; Apps Script)',
+            'Referer': 'https://script.google.com/',
+          },
+        });
+        const code = res.getResponseCode();
+        if (code === 200) {
+          Logger.log('Overpass: served by %s', url);
+          return res.getContentText();
+        }
+        if (code === 429 || code === 504) {
+          Logger.log('Overpass %s busy (%s), waiting 30s', url, code);
+          Utilities.sleep(30000);
+          continue; // retry the same mirror once
+        }
+        problems.push(url + ' -> HTTP ' + code);
+        break; // 4xx that isn't rate limiting: move on
+      } catch (err) {
+        problems.push(url + ' -> ' + (err && err.message ? err.message : err));
+        break;
+      }
+    }
   }
+
+  throw new Error(
+    'No Overpass mirror responded.\n' + problems.join('\n') +
+    '\nCheck https://wiki.openstreetmap.org/wiki/Overpass_API for the current ' +
+    'instance list and update CONFIG.OVERPASS, or use seedFromList() instead.'
+  );
+}
+
+/** Quick connectivity check — run this alone to see which mirrors answer. */
+function testOverpass() {
+  CONFIG.OVERPASS.forEach(function (url) {
+    try {
+      const res = UrlFetchApp.fetch(url, {
+        method: 'post',
+        payload: { data: '[out:json][timeout:10];node(43.5460,-96.7313,43.5470,-96.7303);out 1;' },
+        muteHttpExceptions: true,
+        headers: { 'User-Agent': 'TableStakes/1.0 (connectivity test)' },
+      });
+      Logger.log('%s -> HTTP %s', url, res.getResponseCode());
+    } catch (err) {
+      Logger.log('%s -> %s', url, err && err.message ? err.message : err);
+    }
+  });
+}
+
+/**
+ * Escape hatch if every mirror is unreachable: paste names into this array
+ * and run it. Address and cuisine are optional — "Name | Address | Cuisine".
+ */
+function seedFromList() {
+  const LINES = [
+    // 'Phillips Avenue Diner | 121 S Phillips Ave | american',
+    // 'Sanaa\'s Gourmet Mediterranean | 401 E 8th St | mediterranean',
+  ];
+
+  const list = LINES.map(function (line) {
+    const parts = line.split('|').map(function (s) { return s.trim(); });
+    return {
+      name: parts[0], address: parts[1] || '', cuisine: parts[2] || '',
+      lat: '', lng: '', source: 'manual', source_id: '',
+    };
+  }).filter(function (r) { return r.name; });
+
+  const added = upsertRestaurants_(list);
+  Logger.log('%s restaurants added. Now run syncRatings().', added);
+  return added;
+}
+
+/**
+ * Optional alternative: Google Places API (New). Better coverage of new and
+ * chain locations, but it bills per request and Google's terms limit how long
+ * you may store place details (place IDs are the exception). Set a script
+ * property named PLACES_API_KEY first.
+ */
+function importFromPlaces() {
+  const key = PropertiesService.getScriptProperties().getProperty('PLACES_API_KEY');
+  if (!key) throw new Error('Set a script property named PLACES_API_KEY first.');
+
+  const b = CONFIG.BBOX;
+  const queries = [
+    'restaurants in Sioux Falls SD',
+    'pizza in Sioux Falls SD',
+    'mexican restaurant Sioux Falls SD',
+    'asian restaurant Sioux Falls SD',
+    'steakhouse Sioux Falls SD',
+    'breakfast Sioux Falls SD',
+    'sandwiches Sioux Falls SD',
+    'bar and grill Sioux Falls SD',
+    'coffee Sioux Falls SD',
+    'bakery Sioux Falls SD',
+  ];
+
+  const collected = [];
+  queries.forEach(function (q) {
+    let token = null;
+    for (let page = 0; page < 3; page++) {
+      const body = {
+        textQuery: q,
+        includedType: 'restaurant',
+        maxResultCount: 20,
+        locationRestriction: {
+          rectangle: {
+            low: { latitude: b.s, longitude: b.w },
+            high: { latitude: b.n, longitude: b.e },
+          },
+        },
+      };
+      if (token) body.pageToken = token;
+
+      const res = UrlFetchApp.fetch('https://places.googleapis.com/v1/places:searchText', {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify(body),
+        muteHttpExceptions: true,
+        headers: {
+          'X-Goog-Api-Key': key,
+          'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.primaryTypeDisplayName,nextPageToken',
+        },
+      });
+      if (res.getResponseCode() !== 200) {
+        Logger.log('Places error on "%s": %s', q, res.getContentText().slice(0, 300));
+        break;
+      }
+      const data = JSON.parse(res.getContentText());
+      (data.places || []).forEach(function (p) {
+        collected.push({
+          name: p.displayName ? p.displayName.text : '',
+          address: (p.formattedAddress || '').replace(/, USA$/, ''),
+          cuisine: p.primaryTypeDisplayName ? p.primaryTypeDisplayName.text : '',
+          lat: p.location ? p.location.latitude : '',
+          lng: p.location ? p.location.longitude : '',
+          source: 'places',
+          source_id: p.id,
+        });
+      });
+      token = data.nextPageToken;
+      if (!token) break;
+      Utilities.sleep(2000); // page tokens need a moment to activate
+    }
+  });
+
+  const added = upsertRestaurants_(collected.filter(function (r) { return r.name; }));
+  Logger.log('Places returned %s rows; %s new.', collected.length, added);
+  return added;
+}
+
+function upsertRestaurants_(list) {
+  const sh = sheet_(SHEETS.R);
+  const existing = objects_(sh);
+  const bySource = {};
+  const byName = {};
+  existing.forEach(function (r) {
+    if (r.source_id) bySource[String(r.source_id)] = true;
+    byName[dedupeKey_(r.name, r.address)] = true;
+  });
+
+  let nextNum = existing.length + 1;
+  const rows = [];
+  const seen = {};
+  const now = new Date();
+
+  list.forEach(function (r) {
+    const sk = String(r.source_id || '');
+    const nk = dedupeKey_(r.name, r.address);
+    if (sk && bySource[sk]) return;
+    if (byName[nk]) return;
+    if (seen[nk]) return;
+    seen[nk] = true;
+
+    rows.push([
+      'R' + pad_(nextNum++, 4),
+      r.name, r.address, r.cuisine, r.lat, r.lng, r.source, r.source_id, true, now, '',
+    ]);
+  });
+
+  if (rows.length) {
+    sh.getRange(sh.getLastRow() + 1, 1, rows.length, HEADERS.Restaurants.length).setValues(rows);
+  }
+  return rows.length;
+}
+
+function dedupeKey_(name, address) {
+  const n = String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const a = String(address || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12);
+  return n + '|' + a;
+}
+
+// ---------------------------------------------------------------- ratings sync
+
+/** Create a rating row for every active restaurant that doesn't have one. */
+function syncRatings() {
+  const restaurants = objects_(sheet_(SHEETS.R)).filter(function (r) { return isTrue_(r.active); });
+  const sh = sheet_(SHEETS.T);
+  const have = {};
+  objects_(sh).forEach(function (t) { have[t.restaurant_id] = true; });
+
+  const now = new Date();
+  const rows = [];
+  restaurants.forEach(function (r) {
+    if (have[r.id]) return;
+    rows.push([r.id, CONFIG.START_ELO, 0, 0, 0, 0, now]);
+  });
+
+  if (rows.length) {
+    sh.getRange(sh.getLastRow() + 1, 1, rows.length, HEADERS.Ratings.length).setValues(rows);
+  }
+  Logger.log('%s rating rows added.', rows.length);
+  return rows.length;
+}
+
+// ---------------------------------------------------------------- web api
+
+function doGet(e) {
+  return handle_(e.parameter || {});
+}
+
+function doPost(e) {
+  let body = {};
+  try { body = JSON.parse(e.postData.contents); } catch (err) { body = {}; }
+  return handle_(body);
+}
+
+function handle_(p) {
   try {
-    const cfg = await api('config');
-    users = cfg.users;
-    if (!users.includes(user)) user = users[0];
-    store.setItem('ts_user', user);
-    renderUserSeg();
-    loadPair();
-  } catch (e) { showError(e); }
-})();
-</script>
-</body>
-</html>
+    if (String(p.secret || '') !== CONFIG.SECRET) return json_({ ok: false, error: 'Bad secret' });
+    switch (p.action) {
+      case 'config':  return json_({ ok: true, users: CONFIG.USERS });
+      case 'board':   return json_(board_(p.category));
+      case 'bracket': return withUser_(p, function (u) { return bracket_(u); });
+      case 'crown':   return withUser_(p, function (u) { return crown_(u, p.champion, p.runnerUp, p.field); });
+      case 'pair':    return withUser_(p, function (u) { return { ok: true, pair: pickPair_(u), stats: stats_(u) }; });
+      case 'list':    return withUser_(p, function (u) { return { ok: true, items: listForUser_(u) }; });
+      case 'vote':    return withUser_(p, function (u) { return vote_(u, p.a, p.b, p.result); });
+      case 'mark':    return withUser_(p, function (u) { return mark_(u, p.id, p.status); });
+      default:        return json_({ ok: false, error: 'Unknown action: ' + p.action });
+    }
+  } catch (err) {
+    return json_({ ok: false, error: String(err && err.message ? err.message : err) });
+  }
+}
+
+function withUser_(p, fn) {
+  return json_(fn(normalizeUser_(p.user)));
+}
+
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function normalizeUser_(u) {
+  const match = CONFIG.USERS.filter(function (x) {
+    return x.toLowerCase() === String(u || '').toLowerCase();
+  })[0];
+  if (!match) throw new Error('Unknown user: ' + u);
+  return match;
+}
+
+// ---------------------------------------------------------------- elo
+
+function expected_(ra, rb) {
+  return 1 / (1 + Math.pow(10, (rb - ra) / 400));
+}
+
+function kFactor_(matches) {
+  if (matches < 10) return 40;
+  if (matches < 30) return 24;
+  return 16;
+}
+
+function vote_(user, aId, bId, result) {
+  if (['a', 'b', 'tie'].indexOf(result) === -1) throw new Error('result must be a, b or tie');
+
+  // Both of you write to the same rows, so serialize the read-modify-write.
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const sh = sheet_(SHEETS.T);
+    const rows = objects_(sh);
+    const a = findRating_(rows, aId);
+    const b = findRating_(rows, bId);
+
+    const ra = Number(a.elo), rb = Number(b.elo);
+    const ea = expected_(ra, rb), eb = 1 - ea;
+    const sa = result === 'a' ? 1 : result === 'b' ? 0 : 0.5;
+    const sb = 1 - sa;
+
+    const na = Math.round(ra + kFactor_(Number(a.matches)) * (sa - ea));
+    const nb = Math.round(rb + kFactor_(Number(b.matches)) * (sb - eb));
+
+    writeRating_(sh, a, na, sa);
+    writeRating_(sh, b, nb, sb);
+
+    sheet_(SHEETS.M).appendRow([new Date(), user, aId, bId, result, ra, rb, na, nb]);
+
+    return {
+      ok: true,
+      a: { id: aId, before: ra, after: na, delta: na - ra },
+      b: { id: bId, before: rb, after: nb, delta: nb - rb },
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function writeRating_(sh, row, newElo, score) {
+  const values = [
+    row.restaurant_id,
+    newElo,
+    Number(row.matches) + 1,
+    Number(row.wins) + (score === 1 ? 1 : 0),
+    Number(row.losses) + (score === 0 ? 1 : 0),
+    Number(row.ties) + (score === 0.5 ? 1 : 0),
+    new Date(),
+  ];
+  sh.getRange(row._row, 1, 1, HEADERS.Ratings.length).setValues([values]);
+}
+
+function findRating_(rows, id) {
+  const hit = rows.filter(function (r) { return String(r.restaurant_id) === String(id); })[0];
+  if (!hit) throw new Error('No rating row for ' + id + '. Run syncRatings().');
+  return hit;
+}
+
+// ---------------------------------------------------------------- skips
+
+/** "Never been" is the one thing that stays personal. */
+function skipSet_(user) {
+  const out = {};
+  objects_(sheet_(SHEETS.S)).forEach(function (s) {
+    if (s.user === user) out[s.restaurant_id] = s._row;
+  });
+  return out;
+}
+
+function mark_(user, id, status) {
+  if (['active', 'excluded'].indexOf(status) === -1) throw new Error('status must be active or excluded');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const sh = sheet_(SHEETS.S);
+    const existingRow = skipSet_(user)[id];
+    if (status === 'excluded' && !existingRow) {
+      sh.appendRow([user, id, new Date()]);
+    } else if (status === 'active' && existingRow) {
+      sh.deleteRow(existingRow);
+    }
+    return { ok: true, id: id, status: status };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ---------------------------------------------------------------- bracket
+
+/**
+ * Build a field of eight plus a few alternates.
+ *
+ * Selection favours the least-played places so coverage keeps spreading, and
+ * caps how many entrants share a category so a field isn't four pizza places.
+ * Seeding is by current rating, arranged 1v8 / 4v5 / 3v6 / 2v7 so the two
+ * strongest can only meet in the final.
+ */
+function bracket_(user) {
+  const names = restaurantIndex_();
+  const skips = skipSet_(user);
+  const pool = objects_(sheet_(SHEETS.T)).filter(function (r) {
+    return names[r.restaurant_id] && !skips[r.restaurant_id];
+  });
+
+  const need = CONFIG.BRACKET_SIZE;
+  if (pool.length < need) {
+    throw new Error('Need at least ' + need + ' rateable restaurants; found ' + pool.length + '.');
+  }
+
+  // Weight: fewer matchups first, with a penalty for anything seen recently
+  // and a dash of randomness so the same field never comes up twice.
+  const recent = recentlySeen_(user, 60);
+  pool.forEach(function (r) {
+    r._w = Number(r.matches) + (recent[r.restaurant_id] ? 8 : 0) + Math.random() * 4;
+  });
+  pool.sort(function (x, y) { return x._w - y._w; });
+
+  const picked = [];
+  const spares = [];
+  const catCount = {};
+  pool.forEach(function (r) {
+    if (picked.length >= need && spares.length >= CONFIG.ALTERNATES) return;
+    if (picked.length < need) {
+      // A restaurant counts against every category it lists, so a place tagged
+      // "Pizza, Italian" fills a slot in both.
+      const cats = categoriesOf_(names[r.restaurant_id]);
+      const full = cats.some(function (c) { return (catCount[c.toLowerCase()] || 0) >= CONFIG.CATEGORY_CAP; });
+      if (full) return;
+      cats.forEach(function (c) {
+        const k = c.toLowerCase();
+        catCount[k] = (catCount[k] || 0) + 1;
+      });
+      picked.push(r);
+    } else {
+      spares.push(r);
+    }
+  });
+
+  // If the category cap starved the field (small pool, lopsided cuisines),
+  // top it up ignoring the cap rather than failing.
+  if (picked.length < need) {
+    const have = {};
+    picked.forEach(function (r) { have[r.restaurant_id] = true; });
+    pool.forEach(function (r) {
+      if (picked.length < need && !have[r.restaurant_id]) picked.push(r);
+    });
+  }
+
+  // Seed by rating, then lay out the tree so slots 0v1, 2v3, 4v5, 6v7 are
+  // the quarterfinals and seeds 1 and 2 sit in opposite halves.
+  picked.sort(function (x, y) { return Number(y.elo) - Number(x.elo); });
+  const order = [0, 7, 3, 4, 2, 5, 1, 6];
+  const field = order.map(function (seedIndex, slot) {
+    const card = cardFor_(picked[seedIndex], names);
+    card.seed = seedIndex + 1;
+    card.slot = slot;
+    card.categories = categoriesOf_(names[card.id]);
+    return card;
+  });
+
+  return {
+    ok: true,
+    field: field,
+    alternates: spares.map(function (r) {
+      const card = cardFor_(r, names);
+      card.categories = categoriesOf_(names[card.id]);
+      return card;
+    }),
+    stats: stats_(user),
+  };
+}
+
+/** Restaurant ids appearing in this user's last n matchups. */
+function recentlySeen_(user, n) {
+  const sh = sheet_(SHEETS.M);
+  const last = sh.getLastRow();
+  if (last < 2) return {};
+  const take = Math.min(last - 1, n * CONFIG.USERS.length);
+  const rows = sh.getRange(last - take + 1, 1, take, HEADERS.Matches.length).getValues();
+  const out = {};
+  rows.forEach(function (row) {
+    if (row[1] !== user) return;
+    out[row[2]] = true;
+    out[row[3]] = true;
+  });
+  return out;
+}
+
+/**
+ * Log a finished bracket. The individual matchups were already recorded by
+ * vote_ as they happened, so this is purely the ceremony — it's what makes
+ * "third title" possible on the results screen.
+ */
+function crown_(user, championId, runnerUpId, field) {
+  const names = restaurantIndex_();
+  if (!names[championId]) throw new Error('Unknown champion: ' + championId);
+
+  const ids = Array.isArray(field) ? field : String(field || '').split(',');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    sheet_(SHEETS.B).appendRow([
+      new Date(), user, championId, runnerUpId || '',
+      ids.filter(Boolean).join(','),
+    ]);
+  } finally {
+    lock.releaseLock();
+  }
+
+  const prior = objects_(sheet_(SHEETS.B))
+    .filter(function (b) { return b.champion_id === championId; }).length;
+
+  return { ok: true, champion: names[championId].name, titles: prior };
+}
+
+/** Most recent bracket winners, newest first. */
+function champions_(limit) {
+  const names = restaurantIndex_();
+  return objects_(sheet_(SHEETS.B))
+    .slice(-Number(limit || 6))
+    .reverse()
+    .map(function (b) {
+      const r = names[b.champion_id];
+      return r ? { name: r.name, photo: photoUrl_(r.photo), user: b.user } : null;
+    })
+    .filter(Boolean);
+}
+
+// ---------------------------------------------------------------- categories
+
+/**
+ * Categories come straight out of the `cuisine` column. Split on commas (and
+ * semicolons, which is what OSM emits), trim, and that's the answer — one
+ * restaurant can sit in as many categories as you list. Edit the cell, reload,
+ * and the filters change. Nothing is inferred at read time.
+ */
+function categoriesOf_(restaurant) {
+  const raw = String((restaurant || {}).cuisine || '');
+  const out = [];
+  const seen = {};
+  raw.split(/[,;]/).forEach(function (part) {
+    const t = part.trim().replace(/\s+/g, ' ');
+    if (!t) return;
+    const k = t.toLowerCase();
+    if (seen[k]) return;
+    seen[k] = true;
+    out.push(t);
+  });
+  return out.length ? out : [CONFIG.UNCATEGORIZED];
+}
+
+/**
+ * One-time helper: fills in blank cuisine cells with a comma-separated guess,
+ * so you're editing drafts instead of 200 empty cells. It never touches a cell
+ * you've already written in unless you call seedCategories(true).
+ *
+ * These rules exist only for this function. Nothing at read time uses them, so
+ * once you've curated the column you can ignore or delete this whole section.
+ */
+const CATEGORY_RULES = [
+  ['Pizza',               /pizza|pizzeria/],
+  ['Barbecue',            /barbecue|bbq|smokehouse|smoke house/],
+  ['Mexican',             /mexican|taco|burrito|taqueria|tex.?mex|cantina|azteca|arcos/],
+  ['Latin American',      /latin|argentin|brazil|peruvian|cuban/],
+  ['Chinese',             /chinese|szechwan|kowloon|wok|panda|dumpling/],
+  ['Japanese',            /sushi|japanese|hibachi|teriyaki|ramen|tokyo|fuji|oshima/],
+  ['Thai',                /thai|dokmai/],
+  ['Vietnamese',          /vietnamese|pho\b|saigon/],
+  ['Korean',              /korean|kpot|bibisol/],
+  ['Indian',              /indian|curry|masala/],
+  ['Mediterranean',       /mediterranean|greek|gyro|falafel|shawarma|kebab|lebanese|turkish/],
+  ['African',             /ethiopian|african|lalibela/],
+  ['Italian',             /italian|pasta|ristorante/],
+  ['Steakhouse',          /steak|chophouse/],
+  ['Seafood',             /seafood|lobster|oyster/],
+  ['Fine Dining',         /fine.?dining|bistro/],
+  ['Breakfast',           /breakfast|pancake|brunch|waffle|\begg/],
+  ['Diner',               /diner|fryn|fryin|family restaurant/],
+  ['Sandwiches',          /sandwich|\bsub|deli|philly|hoagie|wrap/],
+  ['Bakery',              /bakery|bagel|cookie|pastry/],
+  ['Coffee',              /coffee|caf\u00e9|cafe|roasterie|espresso/],
+  ['Dessert',             /donut|doughnut|ice.?cream|dessert|custard|creamery|frozen|juice|smoothie/],
+  ['Burgers',             /burger/],
+  ['Chicken',             /chicken|wings|nugget/],
+  ['Fast Food',           /fast.?food|drive.?in|hot.?dog|fries/],
+  ['Bar & Grill',         /\bbar\b|grill|\bpub\b|ale house|gastropub|tavern|saloon|lounge/],
+  ['Brewery',             /brewery|brewpub|\bbeers?\b/],
+  ['Wine Bar',            /wine/],
+  ['American',            /american|comfort|home.?cooking/],
+];
+
+function guessCategories_(restaurant) {
+  const r = restaurant || {};
+  const hay = (String(r.cuisine || '') + ' ' + String(r.name || '')).toLowerCase();
+  const hits = [];
+  CATEGORY_RULES.forEach(function (rule) {
+    if (hits.length < 3 && rule[1].test(hay)) hits.push(rule[0]);
+  });
+  return hits.join(', ');
+}
+
+/** Run once after importing. Pass true to overwrite cells you've already set. */
+function seedCategories(overwrite) {
+  const sh = sheet_(SHEETS.R);
+  const col = HEADERS.Restaurants.indexOf('cuisine') + 1;
+  let filled = 0, blank = 0;
+
+  objects_(sh).forEach(function (r) {
+    if (!overwrite && String(r.cuisine || '').trim()) return;
+    const guess = guessCategories_(r);
+    if (!guess) { blank++; return; }
+    sh.getRange(r._row, col).setValue(guess);
+    filled++;
+  });
+
+  Logger.log('%s cuisine cells filled, %s left blank for you to name.', filled, blank);
+  return filled;
+}
+
+// ---------------------------------------------------------------- pairing
+
+function pickPair_(user) {
+  const names = restaurantIndex_();
+  const skips = skipSet_(user);
+  const pool = objects_(sheet_(SHEETS.T)).filter(function (r) {
+    return names[r.restaurant_id] && !skips[r.restaurant_id];
+  });
+  if (pool.length < 2) throw new Error('Need at least two rateable restaurants. Run syncRatings().');
+
+  const recent = recentPairKeys_();
+
+  // Bias toward the least-played places so coverage evens out.
+  pool.sort(function (x, y) { return Number(x.matches) - Number(y.matches) || Math.random() - 0.5; });
+  const headSize = Math.min(pool.length, Math.max(8, Math.ceil(pool.length * 0.25)));
+  const a = pool[Math.floor(Math.random() * headSize)];
+
+  const others = pool.filter(function (r) { return r.restaurant_id !== a.restaurant_id; });
+  const fresh = others.filter(function (r) { return !recent[pairKey_(a.restaurant_id, r.restaurant_id)]; });
+  const candidates = fresh.length ? fresh : others;
+
+  let b;
+  if (Math.random() < CONFIG.EXPLORE_RATE) {
+    b = candidates[Math.floor(Math.random() * candidates.length)];
+  } else {
+    // Closest in rating makes for the most informative comparison.
+    candidates.sort(function (x, y) {
+      return Math.abs(Number(x.elo) - Number(a.elo)) - Math.abs(Number(y.elo) - Number(a.elo));
+    });
+    const near = candidates.slice(0, Math.min(10, candidates.length));
+    b = near[Math.floor(Math.random() * near.length)];
+  }
+
+  const left = Math.random() < 0.5 ? a : b;
+  const right = left === a ? b : a;
+  return {
+    a: cardFor_(left, names),
+    b: cardFor_(right, names),
+    expectedA: expected_(Number(left.elo), Number(right.elo)),
+  };
+}
+
+function cardFor_(rating, names) {
+  const r = names[rating.restaurant_id] || {};
+  return {
+    id: rating.restaurant_id,
+    name: r.name || rating.restaurant_id,
+    address: r.address || '',
+    cuisine: r.cuisine || '',
+    photo: photoUrl_(r.photo),
+    elo: Number(rating.elo),
+    matches: Number(rating.matches),
+  };
+}
+
+/**
+ * Turn whatever got pasted into the photo column into something an <img> tag
+ * can actually load.
+ *
+ * A Google Drive share link points at a viewer page, not an image, so it will
+ * never render in a browser. Drive's thumbnail endpoint will, provided the
+ * file's sharing is set to "Anyone with the link". Anything else is passed
+ * through untouched; non-https URLs are dropped, since GitHub Pages is served
+ * over https and browsers block mixed content.
+ */
+function photoUrl_(raw) {
+  const url = String(raw || '').trim();
+  if (!url) return '';
+
+  const drive = url.match(/drive\.google\.com\/(?:file\/d\/|open\?id=|uc\?(?:export=[a-z]+&)?id=)([\w-]{20,})/);
+  if (drive) return 'https://drive.google.com/thumbnail?id=' + drive[1] + '&sz=w1200';
+
+  const photos = url.match(/^https:\/\/lh3\.googleusercontent\.com\/[\w\-\/]+/);
+  if (photos) return photos[0] + '=w1200';
+
+  return /^https:\/\//.test(url) ? url : '';
+}
+
+function pairKey_(x, y) {
+  return [String(x), String(y)].sort().join('|');
+}
+
+function recentPairKeys_() {
+  const sh = sheet_(SHEETS.M);
+  const last = sh.getLastRow();
+  if (last < 2) return {};
+  const take = Math.min(last - 1, CONFIG.RECENT_PAIR_MEMORY);
+  const rows = sh.getRange(last - take + 1, 1, take, HEADERS.Matches.length).getValues();
+  const out = {};
+  rows.forEach(function (row) { out[pairKey_(row[2], row[3])] = true; });
+  return out;
+}
+
+// ---------------------------------------------------------------- reads
+
+function restaurantIndex_() {
+  const map = {};
+  objects_(sheet_(SHEETS.R)).forEach(function (r) {
+    if (isTrue_(r.active)) map[r.id] = r;
+  });
+  return map;
+}
+
+function allMatches_() {
+  const sh = sheet_(SHEETS.M);
+  const last = sh.getLastRow();
+  if (last < 2) return [];
+  return sh.getRange(2, 1, last - 1, HEADERS.Matches.length).getValues();
+}
+
+function stats_(user) {
+  const names = restaurantIndex_();
+  const skips = skipSet_(user);
+  const ratings = objects_(sheet_(SHEETS.T)).filter(function (r) { return names[r.restaurant_id]; });
+
+  const byUser = {};
+  CONFIG.USERS.forEach(function (u) { byUser[u] = 0; });
+  const rows = allMatches_();
+  rows.forEach(function (row) { if (byUser[row[1]] != null) byUser[row[1]]++; });
+
+  return {
+    votes: rows.length,
+    byUser: byUser,
+    yours: byUser[user] || 0,
+    inPlay: ratings.filter(function (r) { return !skips[r.restaurant_id]; }).length,
+    skipped: Object.keys(skips).length,
+    untested: ratings.filter(function (r) { return Number(r.matches) === 0; }).length,
+  };
+}
+
+/**
+ * The published rankings. Ratings drive the order but never leave the server —
+ * the payload carries positions, not scores. Only the top half is returned,
+ * and only places with enough matchups to have earned a position.
+ *
+ * With a category selected, the top half is computed *within* that category
+ * rather than intersected with the global top half. Otherwise a category where
+ * nothing scores well would come back empty, which isn't a useful answer to
+ * "what's the best pizza in town".
+ */
+function board_(category) {
+  const names = restaurantIndex_();
+  const rated = objects_(sheet_(SHEETS.T))
+    .filter(function (r) { return names[r.restaurant_id]; })
+    .map(function (r) {
+      const c = cardFor_(r, names);
+      c.categories = categoriesOf_(names[c.id]);
+      return c;
+    });
+
+  const qualified = rated
+    .filter(function (c) { return c.matches >= CONFIG.MIN_MATCHES_RANKED; })
+    .sort(function (x, y) { return y.elo - x.elo; });
+
+  // Group case-insensitively so "pizza" and "Pizza" are one filter, but show
+  // whichever spelling you used most, so "BBQ" doesn't come back as "Bbq".
+  const variants = {}, counts = {};
+  qualified.forEach(function (c) {
+    c.categories.forEach(function (t) {
+      const k = t.toLowerCase();
+      variants[k] = variants[k] || {};
+      variants[k][t] = (variants[k][t] || 0) + 1;
+      counts[k] = (counts[k] || 0) + 1;
+    });
+  });
+  const display = {};
+  Object.keys(variants).forEach(function (k) {
+    display[k] = Object.keys(variants[k]).sort(function (a, b) {
+      return variants[k][b] - variants[k][a]                            // most used wins
+        || (/^[A-Z]/.test(b) ? 1 : 0) - (/^[A-Z]/.test(a) ? 1 : 0)      // then capitalised
+        || a.localeCompare(b);
+    })[0];
+  });
+
+  const categories = Object.keys(counts)
+    .map(function (k) {
+      return { name: display[k], count: counts[k], shown: Math.max(1, Math.ceil(counts[k] * CONFIG.TOP_FRACTION)) };
+    })
+    .sort(function (x, y) { return y.count - x.count || x.name.localeCompare(y.name); });
+
+  const wanted = String(category || '').trim().toLowerCase();
+  const scoped = (wanted && wanted !== 'all')
+    ? qualified.filter(function (c) {
+        return c.categories.some(function (t) { return t.toLowerCase() === wanted; });
+      })
+    : qualified;
+
+  const keep = Math.max(1, Math.ceil(scoped.length * CONFIG.TOP_FRACTION));
+  const top = scoped.slice(0, keep);
+
+  // photoFinish is computed from the ratings before they're dropped.
+  const items = top.map(function (c, i) {
+    const above = i > 0 ? Math.abs(top[i - 1].elo - c.elo) : 999;
+    const below = i < top.length - 1 ? Math.abs(top[i + 1].elo - c.elo) : 999;
+    return {
+      rank: i + 1,
+      id: c.id,
+      name: c.name,
+      address: c.address,
+      categories: c.categories.map(function (t) { return display[t.toLowerCase()] || t; }),
+      photo: c.photo,
+      matches: c.matches,
+      photoFinish: Math.min(above, below) <= CONFIG.PHOTO_FINISH,
+    };
+  });
+
+  return {
+    ok: true,
+    items: items,
+    category: (wanted && wanted !== 'all') ? (display[wanted] || String(category).trim()) : 'All',
+    ranked: scoped.length,
+    provisional: rated.length - qualified.length,
+    minMatches: CONFIG.MIN_MATCHES_RANKED,
+    categories: categories,
+    champions: champions_(6),
+    splits: splitDecisions_(),
+  };
+}
+
+/**
+ * Pairs where the two of you picked opposite winners, using each person's
+ * most recent verdict. Ties don't count as disagreement.
+ */
+function splitDecisions_() {
+  const names = restaurantIndex_();
+  const byPair = {};
+
+  allMatches_().forEach(function (row) {
+    const user = row[1], aId = row[2], bId = row[3], result = row[4];
+    if (result === 'tie') return;
+    const key = pairKey_(aId, bId);
+    if (!byPair[key]) byPair[key] = { picks: {}, ids: [aId, bId] };
+    byPair[key].picks[user] = result === 'a' ? aId : bId;
+  });
+
+  const out = [];
+  Object.keys(byPair).forEach(function (key) {
+    const picks = byPair[key].picks;
+    const users = Object.keys(picks);
+    if (users.length < 2) return;
+    const first = picks[users[0]];
+    if (users.every(function (u) { return picks[u] === first; })) return;
+
+    const ids = byPair[key].ids;
+    if (!names[ids[0]] || !names[ids[1]]) return;
+    out.push({
+      a: names[ids[0]].name,
+      b: names[ids[1]].name,
+      picks: users.map(function (u) {
+        return { user: u, pick: names[picks[u]] ? names[picks[u]].name : picks[u] };
+      }),
+    });
+  });
+  return out;
+}
+
+function listForUser_(user) {
+  const names = restaurantIndex_();
+  const skips = skipSet_(user);
+  return objects_(sheet_(SHEETS.T))
+    .filter(function (r) { return names[r.restaurant_id]; })
+    .map(function (r) {
+      const c = cardFor_(r, names);
+      c.status = skips[r.restaurant_id] ? 'excluded' : 'active';
+      return c;
+    })
+    .sort(function (x, y) { return x.name.localeCompare(y.name); });
+}
+
+// ---------------------------------------------------------------- utils
+
+function sheet_(name) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  if (!sh) throw new Error('Missing sheet: ' + name + '. Run setup().');
+  return sh;
+}
+
+function objects_(sh) {
+  const last = sh.getLastRow();
+  if (last < 2) return [];
+  const width = sh.getLastColumn();
+  const values = sh.getRange(1, 1, last, width).getValues();
+  const head = values[0];
+  const out = [];
+  for (let i = 1; i < values.length; i++) {
+    const obj = { _row: i + 1 };
+    for (let c = 0; c < head.length; c++) {
+      if (head[c]) obj[head[c]] = values[i][c];
+    }
+    if (String(obj[head[0]]).length) out.push(obj);
+  }
+  return out;
+}
+
+function isTrue_(v) {
+  return v === true || String(v).toLowerCase() === 'true';
+}
+
+function pad_(n, width) {
+  return ('0000000' + n).slice(-width);
+}
